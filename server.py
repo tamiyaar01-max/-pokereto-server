@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PokeReto WebSocket Server (Cloud + Offline Messages) - FIXED for websockets 12.0"""
+"""PokeReto WebSocket Server (Cloud + Offline Messages) - v3 no health_check"""
 
 import asyncio
 import json
@@ -7,7 +7,6 @@ import logging
 import os
 import signal
 from datetime import datetime
-from http import HTTPStatus
 from typing import Dict
 
 import websockets
@@ -155,12 +154,6 @@ async def handle_connection(ws):
             manager.disconnect(bell_id)
 
 
-def health_check(connection, request):
-    if request.path in ("/", "/health", "/healthz"):
-        return connection.respond(HTTPStatus.OK, "OK - PokeReto Server\n")
-    return None
-
-
 async def main():
     port = int(os.environ.get("PORT", 8080))
     host = "0.0.0.0"
@@ -176,7 +169,6 @@ async def main():
         handle_connection,
         host,
         port,
-        process_request=health_check,
         ping_interval=30,
         ping_timeout=10,
     ):
