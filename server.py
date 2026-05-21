@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""PokeReto WebSocket Server (Cloud + Offline Messages) - v3 no health_check"""
+"""PokeReto WebSocket Server - DEBUG VERSION with verbose logging"""
 
 import asyncio
 import json
 import logging
 import os
 import signal
+import sys
+import traceback
 from datetime import datetime
 from typing import Dict
 
@@ -14,11 +16,17 @@ import websockets
 import database
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    level=logging.DEBUG,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("pokereto")
+
+ws_log = logging.getLogger("websockets")
+ws_log.setLevel(logging.DEBUG)
+
+log.info(f"Python version: {sys.version}")
+log.info(f"websockets version: {websockets.__version__}")
 
 
 class ConnectionManager:
@@ -90,10 +98,11 @@ manager = ConnectionManager()
 
 
 async def handle_message(ws, bell_id, raw):
+    log.info(f"RECV from {bell_id}: {raw[:200]}")
     try:
         packet = json.loads(raw)
-    except json.JSONDecodeError:
-        log.warning(f"Bad JSON from {bell_id}")
+    except json.JSONDecodeError as e:
+        log.warning(f"Bad JSON from {bell_id}: {e}")
         return
 
     from_bell = packet.get("from", bell_id)
@@ -102,6 +111,7 @@ async def handle_message(ws, bell_id, raw):
     ts = packet.get("ts", datetime.now().timestamp())
 
     if not code:
+        log.warning(f"Empty code from {bell_id}, packet: {packet}")
         return
 
     log.info(f"MESSAGE: {from_bell} -> {to_bell}: {code}")
@@ -123,17 +133,38 @@ async def handle_message(ws, bell_id, raw):
 
 async def handle_connection(ws):
     bell_id = None
+    log.info("=" * 60)
+    log.info(f"NEW CONNECTION accepted")
     try:
+        if hasattr(ws, "request"):
+            req = ws.request
+            log.info(f"  path: {getattr(req, 'path', 'N/A')}")
+            if hasattr(req, "headers"):
+                for h_name, h_val in req.headers.raw_items():
+                    log.info(f"  header: {h_name}: {h_val}")
+        elif hasattr(ws, "path"):
+            log.info(f"  path: {ws.path}")
+        if hasattr(ws, "remote_address"):
+            log.info(f"  remote: {ws.remote_address}")
+    except Exception as e:
+        log.warning(f"Cannot inspect connection: {e}")
+
+    try:
+        log.info("Waiting for hello message (10s timeout)...")
         hello_raw = await asyncio.wait_for(ws.recv(), timeout=10)
+        log.info(f"HELLO received: {hello_raw[:200]}")
         try:
             hello = json.loads(hello_raw)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            log.warning(f"Hello not valid JSON: {e}")
             await ws.close()
             return
         bell_id = hello.get("bellID") or hello.get("from")
         if not bell_id:
+            log.warning(f"No bellID in hello: {hello}")
             await ws.close()
             return
+        log.info(f"Hello parsed: bellID={bell_id}")
         database.register_user(bell_id)
         await manager.connect(ws, bell_id)
         await ws.send(json.dumps({
@@ -141,17 +172,20 @@ async def handle_connection(ws):
             "bellID": bell_id,
             "message": "Connected to PokeReto Cloud",
         }))
+        log.info(f"Welcome sent to {bell_id}")
         async for raw in ws:
             await handle_message(ws, bell_id, raw)
     except asyncio.TimeoutError:
-        log.warning("Hello timeout")
-    except websockets.ConnectionClosed:
-        pass
+        log.warning("Hello timeout (no message in 10s)")
+    except websockets.ConnectionClosed as e:
+        log.info(f"Connection closed normally: {e}")
     except Exception as e:
-        log.error(f"Conn error: {e}")
+        log.error(f"Connection error: {type(e).__name__}: {e}")
+        log.error(traceback.format_exc())
     finally:
         if bell_id:
             manager.disconnect(bell_id)
+        log.info("=" * 60)
 
 
 async def main():
@@ -159,7 +193,9 @@ async def main():
     host = "0.0.0.0"
 
     log.info("=" * 60)
-    log.info(f"PokeReto Server starting on {host}:{port}")
+    log.info(f"PokeReto DEBUG Server starting on {host}:{port}")
+    log.info(f"Python: {sys.version}")
+    log.info(f"websockets: {websockets.__version__}")
     log.info("=" * 60)
 
     database.init_db()
@@ -171,8 +207,9 @@ async def main():
         port,
         ping_interval=30,
         ping_timeout=10,
-    ):
+    ) as server:
         log.info(f"Server ready and listening on ws://{host}:{port}")
+        log.info(f"Server sockets: {server.sockets}")
         stop = asyncio.Future()
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
