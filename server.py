@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PokeReto WebSocket Server - DEBUG VERSION with verbose logging"""
+"""PokeReto WebSocket Server - DEBUG VERSION with health check"""
 
 import asyncio
 import json
@@ -9,6 +9,7 @@ import signal
 import sys
 import traceback
 from datetime import datetime
+from http import HTTPStatus
 from typing import Dict
 
 import websockets
@@ -27,6 +28,19 @@ ws_log.setLevel(logging.DEBUG)
 
 log.info(f"Python version: {sys.version}")
 log.info(f"websockets version: {websockets.__version__}")
+
+
+async def health_check(path, request_headers):
+    """
+    Render's health check sends plain HTTP requests.
+    Return a 200 OK for non-WebSocket requests so Render is happy.
+    Return None to let WebSocket handshake proceed.
+    """
+    upgrade = request_headers.get("Upgrade", "").lower()
+    if upgrade != "websocket":
+        log.info(f"HEALTH CHECK: path={path} -> 200 OK")
+        return (HTTPStatus.OK, [("Content-Type", "text/plain")], b"OK\n")
+    return None
 
 
 class ConnectionManager:
@@ -139,9 +153,6 @@ async def handle_connection(ws):
         if hasattr(ws, "request"):
             req = ws.request
             log.info(f"  path: {getattr(req, 'path', 'N/A')}")
-            if hasattr(req, "headers"):
-                for h_name, h_val in req.headers.raw_items():
-                    log.info(f"  header: {h_name}: {h_val}")
         elif hasattr(ws, "path"):
             log.info(f"  path: {ws.path}")
         if hasattr(ws, "remote_address"):
@@ -205,6 +216,7 @@ async def main():
         handle_connection,
         host,
         port,
+        process_request=health_check,
         ping_interval=30,
         ping_timeout=10,
     ) as server:
