@@ -1,72 +1,80 @@
 #!/usr/bin/env python3
-"""PokeReto WebSocket Server - DEBUG VERSION with health check"""
+"""PokeReto WebSocket Server - Production Ready (websockets 12.0)"""
 
 import asyncio
+import http
 import json
 import logging
 import os
 import signal
 import sys
-import traceback
 from datetime import datetime
-from http import HTTPStatus
-from typing import Dict
+from typing import Dict, Optional
 
 import websockets
+from websockets.server import WebSocketServerProtocol
 
 import database
 
+# =====================================================================
+# Logging
+# =====================================================================
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("pokereto")
-
-ws_log = logging.getLogger("websockets")
-ws_log.setLevel(logging.DEBUG)
-
-log.info(f"Python version: {sys.version}")
-log.info(f"websockets version: {websockets.__version__}")
+logging.getLogger("websockets.server").setLevel(logging.WARNING)
 
 
-async def health_check(path, request_headers):
+# =====================================================================
+# Health Check for Render (websockets 12.0 official pattern)
+# =====================================================================
+async def health_check(path: str, request_headers):
     """
-    Render's health check sends plain HTTP requests.
-    Return a 200 OK for non-WebSocket requests so Render is happy.
-    Return None to let WebSocket handshake proceed.
+    Render sends plain HTTP requests to check if the service is alive.
+    websockets calls this hook BEFORE the WebSocket handshake.
+
+    - For health check paths (/, /health, /healthz): return 200 OK
+    - For WebSocket upgrade requests: return None (let handshake proceed)
     """
-    upgrade = request_headers.get("Upgrade", "").lower()
-    if upgrade != "websocket":
-        log.info(f"HEALTH CHECK: path={path} -> 200 OK")
-        return (HTTPStatus.OK, [("Content-Type", "text/plain")], b"OK\n")
+    if path in ("/", "/health", "/healthz"):
+        return http.HTTPStatus.OK, [("Content-Type", "text/plain")], b"OK\n"
+    # None -> websockets continues with the normal WebSocket handshake
     return None
 
 
+# =====================================================================
+# Connection Manager
+# =====================================================================
 class ConnectionManager:
     def __init__(self):
-        self.active: Dict[str, object] = {}
+        self.active: Dict[str, WebSocketServerProtocol] = {}
 
-    async def connect(self, ws, bell_id):
+    async def connect(self, ws: WebSocketServerProtocol, bell_id: str):
+        # Disconnect any existing connection for this bell_id (one device per id)
         if bell_id in self.active:
+            old_ws = self.active[bell_id]
             try:
-                await self.active[bell_id].close()
+                await old_ws.close(code=1000, reason="Replaced by new connection")
             except Exception:
                 pass
         self.active[bell_id] = ws
-        log.info(f"CONNECTED: {bell_id} (total: {len(self.active)})")
+        log.info(f"CONNECT {bell_id} (active={len(self.active)})")
         await self.deliver_pending(bell_id, ws)
 
-    def disconnect(self, bell_id):
-        if bell_id in self.active:
+    def disconnect(self, bell_id: str, ws: WebSocketServerProtocol):
+        # Only disconnect if this exact ws is still the active one
+        if self.active.get(bell_id) is ws:
             del self.active[bell_id]
-            log.info(f"DISCONNECTED: {bell_id} (total: {len(self.active)})")
+            log.info(f"DISCONNECT {bell_id} (active={len(self.active)})")
 
-    async def deliver_pending(self, bell_id, ws):
+    async def deliver_pending(self, bell_id: str, ws: WebSocketServerProtocol):
         pending = database.get_pending_messages(bell_id)
         if not pending:
             return
-        log.info(f"OFFLINE DELIVERY: {bell_id} has {len(pending)} pending")
+        log.info(f"DELIVER_PENDING {bell_id}: {len(pending)} message(s)")
         for msg in pending:
             packet = {
                 "from": msg["from_bell"],
@@ -79,20 +87,21 @@ class ConnectionManager:
                 await ws.send(json.dumps(packet))
                 database.mark_delivered(msg["id"])
             except Exception as e:
-                log.error(f"Failed offline delivery {msg['id']}: {e}")
+                log.error(f"deliver_pending fail {msg['id']}: {e}")
                 break
 
-    async def send_to(self, bell_id, packet):
-        if bell_id not in self.active:
+    async def send_to(self, bell_id: str, packet: dict) -> bool:
+        ws = self.active.get(bell_id)
+        if ws is None:
             return False
         try:
-            await self.active[bell_id].send(json.dumps(packet))
+            await ws.send(json.dumps(packet))
             return True
         except Exception as e:
-            log.error(f"Send fail {bell_id}: {e}")
+            log.error(f"send_to {bell_id} fail: {e}")
             return False
 
-    async def broadcast(self, packet, exclude=None):
+    async def broadcast(self, packet: dict, exclude: Optional[str] = None) -> int:
         delivered = 0
         for bell_id, ws in list(self.active.items()):
             if bell_id == exclude:
@@ -104,19 +113,21 @@ class ConnectionManager:
                 pass
         return delivered
 
-    def is_online(self, bell_id):
+    def is_online(self, bell_id: str) -> bool:
         return bell_id in self.active
 
 
 manager = ConnectionManager()
 
 
-async def handle_message(ws, bell_id, raw):
-    log.info(f"RECV from {bell_id}: {raw[:200]}")
+# =====================================================================
+# Message Handling
+# =====================================================================
+async def handle_message(ws: WebSocketServerProtocol, bell_id: str, raw: str):
     try:
         packet = json.loads(raw)
-    except json.JSONDecodeError as e:
-        log.warning(f"Bad JSON from {bell_id}: {e}")
+    except json.JSONDecodeError:
+        log.warning(f"Bad JSON from {bell_id}: {raw[:120]}")
         return
 
     from_bell = packet.get("from", bell_id)
@@ -125,87 +136,81 @@ async def handle_message(ws, bell_id, raw):
     ts = packet.get("ts", datetime.now().timestamp())
 
     if not code:
-        log.warning(f"Empty code from {bell_id}, packet: {packet}")
         return
 
-    log.info(f"MESSAGE: {from_bell} -> {to_bell}: {code}")
+    log.info(f"MSG {from_bell} -> {to_bell}: {code}")
     msg_id = database.save_message(from_bell, to_bell, code, ts)
     out = {"from": from_bell, "to": to_bell, "code": code, "ts": ts}
 
     if to_bell == "*":
         delivered = await manager.broadcast(out, exclude=from_bell)
-        log.info(f"BROADCAST: {delivered} recipient(s)")
+        log.info(f"  broadcast -> {delivered} recipient(s)")
         database.mark_delivered(msg_id)
     else:
-        if manager.is_online(to_bell):
-            if await manager.send_to(to_bell, out):
-                database.mark_delivered(msg_id)
-                log.info(f"DELIVERED: {from_bell} -> {to_bell}")
+        if manager.is_online(to_bell) and await manager.send_to(to_bell, out):
+            database.mark_delivered(msg_id)
+            log.info(f"  delivered -> {to_bell}")
         else:
-            log.info(f"OFFLINE: {to_bell} stored")
+            log.info(f"  offline, stored for {to_bell}")
 
 
-async def handle_connection(ws):
-    bell_id = None
-    log.info("=" * 60)
-    log.info(f"NEW CONNECTION accepted")
+# =====================================================================
+# Connection Handler
+# =====================================================================
+async def handle_connection(ws: WebSocketServerProtocol, path: str = "/"):
+    bell_id: Optional[str] = None
     try:
-        if hasattr(ws, "request"):
-            req = ws.request
-            log.info(f"  path: {getattr(req, 'path', 'N/A')}")
-        elif hasattr(ws, "path"):
-            log.info(f"  path: {ws.path}")
-        if hasattr(ws, "remote_address"):
-            log.info(f"  remote: {ws.remote_address}")
-    except Exception as e:
-        log.warning(f"Cannot inspect connection: {e}")
+        # Wait for "hello" message to identify the device
+        try:
+            hello_raw = await asyncio.wait_for(ws.recv(), timeout=15)
+        except asyncio.TimeoutError:
+            log.warning("hello timeout, closing")
+            return
 
-    try:
-        log.info("Waiting for hello message (10s timeout)...")
-        hello_raw = await asyncio.wait_for(ws.recv(), timeout=10)
-        log.info(f"HELLO received: {hello_raw[:200]}")
         try:
             hello = json.loads(hello_raw)
-        except json.JSONDecodeError as e:
-            log.warning(f"Hello not valid JSON: {e}")
-            await ws.close()
+        except json.JSONDecodeError:
+            log.warning(f"hello not JSON: {hello_raw[:120]}")
             return
+
         bell_id = hello.get("bellID") or hello.get("from")
         if not bell_id:
-            log.warning(f"No bellID in hello: {hello}")
-            await ws.close()
+            log.warning(f"hello missing bellID: {hello}")
             return
-        log.info(f"Hello parsed: bellID={bell_id}")
+
         database.register_user(bell_id)
         await manager.connect(ws, bell_id)
+
+        # Send welcome
         await ws.send(json.dumps({
             "type": "welcome",
             "bellID": bell_id,
             "message": "Connected to PokeReto Cloud",
         }))
-        log.info(f"Welcome sent to {bell_id}")
+
+        # Main message loop
         async for raw in ws:
             await handle_message(ws, bell_id, raw)
-    except asyncio.TimeoutError:
-        log.warning("Hello timeout (no message in 10s)")
-    except websockets.ConnectionClosed as e:
-        log.info(f"Connection closed normally: {e}")
+
+    except websockets.ConnectionClosed:
+        pass
     except Exception as e:
-        log.error(f"Connection error: {type(e).__name__}: {e}")
-        log.error(traceback.format_exc())
+        log.error(f"connection error ({bell_id}): {type(e).__name__}: {e}")
     finally:
         if bell_id:
-            manager.disconnect(bell_id)
-        log.info("=" * 60)
+            manager.disconnect(bell_id, ws)
 
 
+# =====================================================================
+# Main
+# =====================================================================
 async def main():
     port = int(os.environ.get("PORT", 8080))
     host = "0.0.0.0"
 
     log.info("=" * 60)
-    log.info(f"PokeReto DEBUG Server starting on {host}:{port}")
-    log.info(f"Python: {sys.version}")
+    log.info(f"PokeReto Server starting on {host}:{port}")
+    log.info(f"Python: {sys.version.split()[0]}")
     log.info(f"websockets: {websockets.__version__}")
     log.info("=" * 60)
 
@@ -218,10 +223,10 @@ async def main():
         port,
         process_request=health_check,
         ping_interval=30,
-        ping_timeout=10,
-    ) as server:
-        log.info(f"Server ready and listening on ws://{host}:{port}")
-        log.info(f"Server sockets: {server.sockets}")
+        ping_timeout=20,
+        close_timeout=10,
+    ):
+        log.info(f"Server ready: ws://{host}:{port}")
         stop = asyncio.Future()
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
